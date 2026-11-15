@@ -1,0 +1,6 @@
+MOFOperations.py
+pyproject.toml
+myownpackage.egg-info/PKG-INFO
+myownpackage.egg-info/SOURCES.txt
+myownpackage.egg-info/dependency_links.txt
+myownpackage.egg-info/top_level.txt
