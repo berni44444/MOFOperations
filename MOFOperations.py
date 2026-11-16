@@ -2755,6 +2755,7 @@ C             0       0.0
                 if current_energy < cycle_best_energy:
                     cycle_best = self.atoms.copy()
                     cycle_best_energy = current_energy
+                    LogToXYZ(cycle_best, "BestCandidate.xyz", "w")
                     
 
 
@@ -2930,7 +2931,7 @@ C             0       0.0
                 if current_energy < cycle_best_energy:
                     cycle_best = self.atoms.copy()
                     cycle_best_energy = current_energy
-                    
+                    LogToXYZ(cycle_best, "BestCandidate.xyz", "w")
 
 
                 temperature *= cooling_rate
@@ -3074,7 +3075,7 @@ C             0       0.0
                 if current_energy < cycle_best_energy:
                     cycle_best = self.atoms.copy()
                     cycle_best_energy = current_energy
-                    
+                    LogToXYZ(cycle_best, "BestCandidate.xyz", "w")
 
 
 
@@ -3213,7 +3214,7 @@ C             0       0.0
                 if current_energy < cycle_best_energy:
                     cycle_best = self.atoms.copy()
                     cycle_best_energy = current_energy
-                    
+                    LogToXYZ(cycle_best, "BestCandidate.xyz", "w")
 
         write(self.final_structurefile, cycle_best, format="extxyz", append=True)
         trajectory.close()
