@@ -2714,7 +2714,7 @@ C             0       0.0
                         case "dihedral":
                             update_dihedral(self.dihedral_log,move_data["linker_index"])
 
-                    if self.output_frequency <= 1:
+                    if self.output_frequency < 0:
                         append_array_log(self.orientation_logfile, self.rotational_log, steps)
                         append_array_log(self.permutation_logfile, self.permutation_log, steps)
                         append_array_log(self.dihedral_logfile, self.dihedral_log, steps)
@@ -2734,7 +2734,7 @@ C             0       0.0
                 
     
 
-                if ((self.output_frequency > 1) and (steps % self.output_frequency == 0)):
+                if ((self.output_frequency > 0) and (steps % self.output_frequency == 0)):
                     append_array_log(self.orientation_logfile, self.rotational_log, steps)
                     append_array_log(self.permutation_logfile, self.permutation_log, steps)
                     append_array_log(self.dihedral_logfile, self.dihedral_log, steps)
