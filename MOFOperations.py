@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 from pathlib import Path
-from time import time
+from time import time, time_ns
 from matplotlib.table import Cell
 import numpy as np
 
@@ -15,13 +15,13 @@ from ase.io import Trajectory, write
 from ase.data import atomic_numbers
 from ase.optimize import LBFGS
 from ase.calculators.calculator import Calculator, all_changes
-#from ase.calculators.mixing import SumCalculator
 from ase.filters import UnitCellFilter
 from ase.units import kB
 
 import subprocess
 import re
 import shutil
+import json
 
 import pandas as pd
 
@@ -36,7 +36,7 @@ else:
 start_time = time()
 
 
-def readYaml(filepath: str):
+def readYaml(filepath: str, allow_existing_files: bool = False):
     """
     Load and validate a Monte Carlo optimization configuration.
 
@@ -64,8 +64,7 @@ def readYaml(filepath: str):
         paramsYaml = yaml.safe_load(f)
 
 
-    if paramsYaml["folder"] == "":
-        paramsYaml["folder"] = Path(filepath).parent
+    folder = Path(paramsYaml.get("folder") or Path(filepath).parent)
     
     if paramsYaml["outputfile"] == "":
         outputfile = "final_" + paramsYaml["filename"]
@@ -74,40 +73,104 @@ def readYaml(filepath: str):
 
     paramsYaml["outputfile"] = outputfile
 
+        # output frequency
+    if (not isinstance(paramsYaml["output_frequency"], int)
+            or isinstance(paramsYaml["output_frequency"], bool)):
+        raise TypeError(f"Invalid 'output_frequency': {paramsYaml['output_frequency']}. "
+                        "The value must be an integer.")
+
+    restart_interval = paramsYaml.get("restart_interval", 100)
+    if (not isinstance(restart_interval, int)
+            or isinstance(restart_interval, bool)
+            or restart_interval < 0):
+        raise TypeError(
+            "Invalid 'restart_interval': "
+            f"{restart_interval}. The value must be a non-negative integer."
+        )
+
+
+
     prefix = paramsYaml.get("prefix", "")
 
-    logging_files = {
-        "outputfile": paramsYaml["folder"] + "/" + prefix + outputfile,
-        "logfile": paramsYaml["folder"] + "/" + prefix + paramsYaml.get("logfile", "output.dat"),
-        "trajectoryfile": paramsYaml["folder"] + "/" + prefix + paramsYaml.get("trajectoryfile", "traj_annealing.traj"),
-        "final_structurefile": paramsYaml["folder"] + "/" + prefix + paramsYaml.get("final_structurefile", "final_structure.xyz"),
-        "orientation_logfile": paramsYaml["folder"] + "/" + prefix + paramsYaml.get("orientation_logfile"),
-        "permutation_logfile": paramsYaml["folder"] + "/" + prefix + paramsYaml.get("permutation_logfile"),
-        "dihedral_logfile": paramsYaml["folder"] + "/" + prefix + paramsYaml.get("dihedral_logfile"),
-        "optimization_logfile": paramsYaml["folder"] + "/" + prefix + paramsYaml.get("optimization_logfile"),
-        "dftbp_temporary_optimization_log_file": paramsYaml["folder"] + "/" + prefix + paramsYaml.get("dftbp_temporary_optimization_log_file", "dftb.out")
-    }
-    
-    for name, filename in logging_files.items():
+    def configured_path(name: str, default: str | None = None) -> str | None:
+        filename = paramsYaml.get(name, default)
         if filename is None:
-            continue
+            return None
         if not isinstance(filename, str) or not filename:
             raise TypeError(f"'{name}' must be a non-empty filename.")
+        return str(folder / f"{prefix}{filename}")
 
-        if Path(filename).exists():
-            raise FileExistsError(
-                f"Logging file already exists: '{filename}'. "
-                "Please choose a different filename."
-            )
+    logging_files = {
+        "outputfile": str(folder / f"{prefix}{outputfile}"),
+        "logfile": configured_path("logfile", "_output.dat"),
+        "trajectoryfile": configured_path("trajectoryfile", "_traj_annealing.traj"),
+        "final_structurefile": configured_path("final_structurefile", "_final_structure.xyz"),
+        "best_candidatefile": configured_path("best_candidatefile", "_BestCandidate.xyz"),
+        "best_candidate_orientationfile": configured_path("best_candidate_orientationfile", "_BestCandidateOrientation.dat"),
+        "best_candidate_permutationfile": configured_path("best_candidate_permutationfile", "_BestCandidatePermutation.dat"),
+        "best_candidate_dihedralfile": configured_path("best_candidate_dihedralfile", "_BestCandidateDihedral.dat"),
+        "best_candidate_logfile": configured_path("best_candidate_logfile", "_BestCandidate.dat"),
+        "orientation_logfile": configured_path("orientation_logfile"),
+        "permutation_logfile": configured_path("permutation_logfile"),
+        "dihedral_logfile": configured_path("dihedral_logfile"),
+        "optimization_logfile": configured_path("optimization_logfile"),
+        "dftbp_temporary_optimization_log_file": configured_path(
+            "dftbp_temporary_optimization_log_file", "dftb.out"
+        ),
+    }
 
-    logging_paths = [
-        Path(filename) for filename in logging_files.values() if filename is not None
-    ]
-    if len(logging_paths) != len(set(logging_paths)):
-        raise ValueError("Logging files must have different filenames.")
+    restart_files = {
+        "restart_structurefile": configured_path("restart_structurefile", "_restart.xyz"),
+        "restart_orientation_logfile": configured_path(
+            "restart_orientation_logfile", "_restart_orientation.dat"
+        ),
+        "restart_permutation_logfile": configured_path(
+            "restart_permutation_logfile", "_restart_permutation.dat"
+        ),
+        "restart_dihedral_logfile": configured_path(
+            "restart_dihedral_logfile", "_restart_dihedral.dat"
+        ),
+        "restart_logfile": configured_path("restart_logfile", "_restart_output.dat"),
+    }
+
+    if not allow_existing_files and paramsYaml["output_frequency"] != 0:
+        for name, filename in logging_files.items():
+            if filename is not None and Path(filename).exists():
+                raise FileExistsError(
+                    f"Logging file already exists: '{filename}'. "
+                    "Please choose a different filename."
+                )
+
+        logging_paths = [
+            Path(filename) for filename in logging_files.values() if filename is not None
+        ]
+        if len(logging_paths) != len(set(logging_paths)):
+            raise ValueError("Logging files must have different filenames.")
+
+    if restart_interval > 0:
+        restart_paths = [Path(filename) for filename in restart_files.values()]
+        if len(restart_paths) != len(set(restart_paths)):
+            raise ValueError("Restart files must have different filenames.")
+        if paramsYaml["output_frequency"] != 0:
+            active_logging_paths = {
+                Path(filename)
+                for filename in logging_files.values()
+                if filename is not None
+            }
+            if active_logging_paths.intersection(restart_paths):
+                raise ValueError("Restart files must differ from logging files.")
+        if not allow_existing_files:
+            for filename in restart_paths:
+                if filename.exists():
+                    raise FileExistsError(
+                        f"Restart file already exists: '{filename}'. "
+                        "Please choose a different filename."
+                    )
 
     paramsYaml.update(logging_files)
-
+    paramsYaml.update(restart_files)
+    paramsYaml["restart_interval"] = restart_interval
+    
 
 
     # bits
@@ -144,12 +207,6 @@ def readYaml(filepath: str):
     
     
 
-    # output frequency
-    if (not isinstance(paramsYaml["output_frequency"], int)
-            or isinstance(paramsYaml["output_frequency"], bool)):
-        raise TypeError(f"Invalid 'output_frequency': {paramsYaml['output_frequency']}. "
-                        "The value must be an integer.")
-
     paramsYaml["job_type"] = paramsYaml["job_type"].strip()
 
     if paramsYaml["job_type"] not in ("annealing", "sampling_constant_T", "annealing_dftbp", "sampling_constant_T_dftbp"):
@@ -174,6 +231,10 @@ def readYaml(filepath: str):
             raise TypeError(f"Invalid 'Tfinal': {paramsYaml['Tfinal']}. "
                             "The value must be a positive float.")
 
+        # Temperate ramp style
+        if paramsYaml["T-ramp"] not in ("linear", "proportional"):
+            raise ValueError(f"Invalid 'T-ramp': {paramsYaml['T-ramp']}. "
+                             "Allowed values are 'linear' or 'proportional'.")
         
         # first cooling rate
         if not isinstance(paramsYaml["cooling_first"], float) or not 0 < paramsYaml["cooling_first"] <= 1:
@@ -1138,12 +1199,154 @@ def write_acceptance_ratio(f,
 
 
 
-def append_array_log(filepath: str | None, values: np.ndarray, step: int=0) -> None:
+
+def write_best_candidate_log(best_candidate_logfile: str | Path | None, 
+                             steps: int, 
+                             energy: float, 
+                             temperature: float, 
+                             ratio: float,
+                             write_header: bool = True,
+                             write_type: str = "a") -> None:
+    """Write a best candidate log entry."""
+    if best_candidate_logfile is None:
+        return
+    with open(best_candidate_logfile, write_type) as log_file:
+        if write_header:
+            log_file.write(f"Steps\tEnergy\tTemperature\tRatio\n")
+        log_file.write(f"{steps}\t{energy:.5f}\t{temperature:.3f}\t{ratio:.4f}\n")
+        log_file.flush()
+
+
+
+def write_array_logs(filepath: str | None, values: np.ndarray, step: int=0, write_type: str = "a") -> None:
     """Append one integer-array snapshot without touching disabled logs."""
     if filepath is None:
         return
-    with open(filepath, "a") as log_file:
+    with open(filepath, write_type) as log_file:
         np.savetxt(log_file, np.asarray( np.append([step],values), dtype=int)[None, :], fmt="%d")
+
+
+def should_log_step(output_frequency: int, step: int, accepted: bool) -> bool:
+    """Return whether a Monte Carlo step should be written to output logs.
+
+    ``0`` disables logging, negative values log accepted moves only, and
+    positive values log every ``output_frequency`` Monte Carlo attempts.
+    """
+    if output_frequency == 0:
+        return False
+    if output_frequency < 0:
+        return accepted
+    return step % output_frequency == 0
+
+
+def write_restart_checkpoint(atoms: Atoms,
+                             restart_files: dict,
+                             cycle_number: int,
+                             step: int,
+                             elapsed_time: float,
+                             energy: float,
+                             temperature: float,
+                             acceptance_ratio: float,
+                             accepted: int,
+                             operation_attempts: dict,
+                             operation_accepts: dict,
+                             rotational_log: np.ndarray,
+                             permutation_log: np.ndarray,
+                             dihedral_log: np.ndarray,
+                             log_offsets: dict[str, int],
+                             trajectory_frames: int,
+                             output_paths: dict[str, str | None],
+                             cycle_complete: bool = False) -> None:
+    """Overwrite restart files with a consistent snapshot of the current run."""
+    LogToXYZ(atoms, restart_files["restart_structurefile"], mode="w")
+
+    for operation, values in (
+        ("orientation", rotational_log),
+        ("permutation", permutation_log),
+        ("dihedral", dihedral_log),
+    ):
+        if values is not None and len(values):
+            write_array_logs(
+                restart_files[f"restart_{operation}_logfile"],
+                values,
+                step,
+                write_type="w",
+            )
+
+    with open(restart_files["restart_logfile"], "w", encoding="utf-8") as log_file:
+        checkpoint = {
+            "cycle": cycle_number,
+            "step": step,
+            "accepted": accepted,
+            "time": elapsed_time,
+            "energy": energy,
+            "temperature": temperature,
+            "acceptance_ratio": acceptance_ratio,
+            "operation_attempts": operation_attempts,
+            "operation_accepts": operation_accepts,
+            "log_offsets": log_offsets,
+            "trajectory_frames": trajectory_frames,
+            "output_paths": output_paths,
+            "cycle_complete": cycle_complete,
+        }
+        log_file.write("# checkpoint " + json.dumps(checkpoint) + "\n")
+        log_file.write(
+            "Steps\tTime(s)\tEnergy(eV)\tTemperature(K)\tAcceptance Ratio"
+            "\tRotation Attempts\tPermutation Attempts\tDihedral Attempts"
+            "\tRotation Acceptance Ratio\tPermutation Acceptance Ratio"
+            "\tDihedral Acceptance Ratio\n"
+        )
+        write_acceptance_ratio(
+            log_file,
+            step,
+            elapsed_time,
+            energy,
+            temperature,
+            acceptance_ratio,
+            operation_attempts["rotation"],
+            operation_attempts["permutation"],
+            operation_attempts["dihedral"],
+            operation_accepts["rotation"] / operation_attempts["rotation"]
+            if operation_attempts["rotation"] else 0.0,
+            operation_accepts["permutation"] / operation_attempts["permutation"]
+            if operation_attempts["permutation"] else 0.0,
+            operation_accepts["dihedral"] / operation_attempts["dihedral"]
+            if operation_attempts["dihedral"] else 0.0,
+        )
+
+
+def read_restart_checkpoint(filename: str | Path) -> dict:
+    """Read checkpoint metadata written by ``write_restart_checkpoint``."""
+    with Path(filename).open("r", encoding="utf-8") as checkpoint_file:
+        first_line = checkpoint_file.readline()
+    prefix = "# checkpoint "
+    if not first_line.startswith(prefix):
+        raise ValueError(f"Restart checkpoint '{filename}' has no metadata header.")
+    return json.loads(first_line[len(prefix):])
+
+
+def trim_logs_to_checkpoint(log_offsets: dict[str, int],
+                            trajectory_filename: str | Path,
+                            trajectory_frames: int | None) -> None:
+    """Discard log data written after the selected restart checkpoint."""
+    for filename, offset in log_offsets.items():
+        path = Path(filename)
+        if path.exists():
+            with path.open("r+b") as log_file:
+                log_file.truncate(offset)
+
+    trajectory_path = Path(trajectory_filename)
+    if trajectory_frames is None or not trajectory_path.exists():
+        return
+
+    temporary_path = trajectory_path.with_name(trajectory_path.name + ".restart-tmp")
+    with Trajectory(trajectory_path, "r") as old_trajectory:
+        if trajectory_frames > len(old_trajectory):
+            raise ValueError("Trajectory has fewer frames than the restart checkpoint.")
+        with Trajectory(temporary_path, "w") as new_trajectory:
+            for frame_index in range(trajectory_frames):
+                new_trajectory.write(old_trajectory[frame_index])
+    temporary_path.replace(trajectory_path)
 
 
 def swap_residues(residues: list[Atoms],
@@ -1904,11 +2107,26 @@ class MOF:
         self.logfile = None
         self.trajectoryfile = None
         self.final_structurefile = None
+
+        self.best_candidatefile = None
+        self.best_candidate_rotation_logfile = None
+        self.best_candidate_permutation_logfile = None
+        self.best_candidate_dihedral_logfile = None
+        self.best_candidate_logfile = None
+
+
         self.orientation_logfile = None
         self.permutation_logfile = None
         self.dihedral_logfile = None
         self.optimization_logfile = None
         self.dftbp_temporary_optimization_log_file = None
+        self.restart_interval = 0
+        self.restart_files = None
+        self._trajectory_frame_count = 0
+        self.configuration_file = None
+        self._elapsed_time_offset = 0.0
+        self._restart_energy = None
+        self._current_dftbp_energy = None
 
         # Calculation parameters
         self.job_type = None
@@ -1927,6 +2145,7 @@ class MOF:
         self.Tinitial = None
         self.Tfinal = None
         self.Tsampling = None
+        self.TRamp = None
         self.thermocycles = None
         self.cooling_first = None
         self.cooling_rate = None
@@ -1945,8 +2164,17 @@ class MOF:
 
 
         self.DEFAULT_CONFIGURATION_TEMPLATE = """# Configuration for MOF Monte Carlo optimization.
-# Copy an input structure to filename before running the calculation.
+# Directory in which logging and output files are written.
+folder: {folder}
+
+# Optional prefix added to every generated logging filename.
+prefix: ""
+
+# Copy an input structure to this filename before running the calculation.
 filename: {input_filename}
+
+# Molecule definitions used to assign residue numbers.
+moldescriptor_file: {moldescriptor_filename}
 
 # Plain XYZ trajectory log, readable by VMD. This file must not exist yet.
 outputfile: trajectory.xyz
@@ -1954,19 +2182,33 @@ outputfile: trajectory.xyz
 # Energy, temperature, and acceptance statistics. This file must not exist yet.
 logfile: output.dat
 
-# ASE binary trajectory. This file must not exist yet.
+# ASE binary trajectory log. This file must not exist yet.
 trajectoryfile: trajectory.traj
 
-# Best structure after all thermocycles. This file must not exist yet.
+# Final structure written after all thermocycles. This file must not exist yet.
 final_structurefile: final_structure.xyz
 
-# Optional operation logs. Set to null to disable them.
-orientation_logfile: null
-permutation_logfile: null
-dihedral_logfile: null
-optimization_logfile: null
-# MACE model size: small, medium, or large.
-version: medium
+# Optional operation-state logs. Set an entry to null to disable that log.
+orientation_logfile: orientation.dat
+permutation_logfile: permutation.dat
+dihedral_logfile: dihedral.dat
+optimization_logfile: optimizationSteps.dat
+
+# Available modes: annealing, sampling_constant_T, annealing_dftbp,
+# or sampling_constant_T_dftbp.
+job_type: annealing
+
+# Logging policy:
+#   0  = no logging
+#  <0  = log after every accepted Metropolis step
+#  >0  = log every N MC attempts
+output_frequency: 3
+
+# Overwrite restart snapshots after every N Monte Carlo moves; 0 disables them.
+restart_interval: 100
+
+# MACE model size: small, medium, large, or mace_dac.
+version: large
 
 # Initial temperature for the first cycle, in K.
 Tfirst: 5000.0
@@ -1974,7 +2216,7 @@ Tfirst: 5000.0
 # Initial temperature for subsequent thermocycles, in K.
 Tinit: 200.0
 
-# Multiplicative cooling factor for the first cycle (0 < value < 1).
+# Temperature reduction for the first cycle (0 < value <= 1).
 cooling_first: 0.995
 
 # Final temperature for every cycle, in K.
@@ -1983,23 +2225,26 @@ Tfinal: 1.0
 # Multiplicative cooling factor for subsequent cycles (0 < value <= 1).
 cooling_rate: 0.99
 
-# Number of thermocycles after the first cycle.
-number_of_thermocycles: 1
+# Linear or proportional temperature ramp.
+T-ramp: linear
 
-# Relative frequencies of permutation and rotation moves.
+# Number of thermocycles after the first cycle.
+number_of_thermocycles: 10
+
+# Parameters used by constant-temperature sampling modes.
+Tsampling: 298.15
+sampling_steps: 10000
+
+# Relative frequencies of permutation, rotation, and dihedral moves.
 weight_permutation: 1.0
 weight_rotation: 1.0
-weight_dihedral_flips: 1.0
+weight_dihedral_flips: 0.0
 
 # Maximum force for geometry optimization, in eV/Angstrom.
 fmax: 0.1
 
 # Maximum optimizer steps per trial move.
-max_steps: 10000
-
-# Operation-state log frequency. 0 disables these logs, negative values log
-# after every successful Metropolis step, positive values log every Nth success.
-output_frequency: -1
+max_steps: 20000
 
 # Whether MACE includes dispersion interactions.
 dispersion: true
@@ -2007,30 +2252,36 @@ dispersion: true
 # Whether only hydrostatic unit-cell strain is optimized.
 hydrostatic_strain: true
 
-# MACE numerical precision. Allowed values are 32 or 64.
+# MACE numerical precision: 32 or 64.
 bits: 32
 
-# optimize cell parameters (bool)
-optimize_cell_parameters: False
+# Whether to optimize unit-cell parameters during MACE calculations.
+optimize_cell_parameters: true
 
-# Residue types eligible for rotation and local atom indices defining axes.
+# DFTB+ temporary output log. Used only by DFTB+ job types.
+dftbp_temporary_optimization_log_file: dftb.out
+
+# Residue types eligible for rotation and local atom indices defining the axes.
 rotational_residues:
-  3: [9, 12, 13, 14]
+  3: [8, 11, 12, 13]
 
 # Rotation angle in degrees.
 angle_of_rotation: 180
 
 # Residue types eligible for permutation and local anchor atom indices.
-# At least two residue types are required when permutation is enabled.
+# At least two different residue types are required for permutation.
 permutational_residues:
-  3: [9, 12, 13, 14]
+  3: [8, 11, 12, 13]
   4: [8, 11, 12, 13]
 
-# Residuenumbers and local atomic indices for dihedral flipping
-# only necessary for non-planar linkers
-# leave empty if no dihedral flipping is wanted
+# Residue types and local atom indices for dihedral flipping.
+# Each residue contains [flipping_indices, anchor_indices].
+# Remove or set dihedral_residues to null to disable dihedral moves.
 dihedral_residues:
- 3: [[0,2,4,7,9,15], [8,11,12,13]]
+  3: [[0, 2, 4, 7, 9, 15], [8, 11, 12, 13]]
+
+# Optional pair restraints. Set to null to disable restraints.
+constraints: null
 """
 
         self.DEFAULT_MOLDESCRIPTOR = """# Molecule definitions used to assign residue numbers.
@@ -2130,7 +2381,11 @@ C             0       0.0
                 raise FileExistsError(f"Default file(s) already exist: {names}")
 
         configuration_path.write_text(
-            self.DEFAULT_CONFIGURATION_TEMPLATE.format(input_filename=input_filename),
+            self.DEFAULT_CONFIGURATION_TEMPLATE.format(
+                folder=target_directory.resolve(),
+                input_filename=input_filename,
+                moldescriptor_filename=moldescriptor_filename,
+            ),
             encoding="utf-8",
         )
         moldescriptor_path.write_text(self.DEFAULT_MOLDESCRIPTOR, encoding="utf-8")
@@ -2143,7 +2398,7 @@ C             0       0.0
 
 
     # Read the yaml 
-    def set_yaml(self, filepath):
+    def set_yaml(self, filepath, allow_existing_files: bool = False):
         """
         Checks the YAML file for its sanity and loads the parameters.
         Also loads the PQ data from the specified xyz file.
@@ -2153,7 +2408,8 @@ C             0       0.0
 
         """
 
-        paramsYaml = readYaml(filepath)
+        paramsYaml = readYaml(filepath, allow_existing_files=allow_existing_files)
+        self.configuration_file = Path(filepath)
 
         self.job_type = paramsYaml["job_type"]
 
@@ -2164,6 +2420,13 @@ C             0       0.0
         self.logfile = paramsYaml["logfile"]
         self.trajectoryfile = paramsYaml["trajectoryfile"]
         self.final_structurefile = paramsYaml["final_structurefile"]
+
+        self.best_candidatefile = paramsYaml["best_candidatefile"]
+        self.best_candidate_rotation_logfile = paramsYaml["best_candidate_orientationfile"]
+        self.best_candidate_permutation_logfile = paramsYaml["best_candidate_permutationfile"]
+        self.best_candidate_dihedral_logfile = paramsYaml["best_candidate_dihedralfile"]
+        self.best_candidate_logfile = paramsYaml["best_candidate_logfile"]
+
         self.orientation_logfile = paramsYaml["orientation_logfile"]
         self.permutation_logfile = paramsYaml["permutation_logfile"]
         self.dihedral_logfile = paramsYaml["dihedral_logfile"]
@@ -2184,6 +2447,17 @@ C             0       0.0
         self.optimization_logfile = paramsYaml["optimization_logfile"]
 
         self.output_frequency = paramsYaml["output_frequency"]
+        self.restart_interval = paramsYaml["restart_interval"]
+        self.restart_files = {
+            name: paramsYaml[name]
+            for name in (
+                "restart_structurefile",
+                "restart_orientation_logfile",
+                "restart_permutation_logfile",
+                "restart_dihedral_logfile",
+                "restart_logfile",
+            )
+        }
 
         self.fmax = float(paramsYaml["fmax"])
 
@@ -2212,6 +2486,7 @@ C             0       0.0
 
             self.thermocycles = int(paramsYaml["number_of_thermocycles"])
 
+            self.TRamp = paramsYaml["T-ramp"]
             self.cooling_first = float(paramsYaml["cooling_first"])
             self.cooling_rate = float(paramsYaml["cooling_rate"])
 
@@ -2571,7 +2846,14 @@ C             0       0.0
         move_data = {}
 
         old_atoms = self.atoms.copy()
-        old_energy = Energy_from_dftbp_log()
+        if self._current_dftbp_energy is None:
+            self._current_dftbp_energy = (
+                self._restart_energy
+                if self._restart_energy is not None
+                else Energy_from_dftbp_log()
+            )
+        old_energy = self._current_dftbp_energy
+        self._restart_energy = None
 
 
         move_selector = np.random.rand() * total_weight
@@ -2614,6 +2896,7 @@ C             0       0.0
             #self.LogXYZ()
             return False, operation, move_data, nOptimizationSteps
 
+        self._current_dftbp_energy = new_energy
         return True, operation, move_data, nOptimizationSteps
 
 
@@ -2634,11 +2917,160 @@ C             0       0.0
             raise ValueError(f"Unknown job type: {self.job_type}")
 
 
+    def restartSimulationFromCheckpoint(self,
+                          filepath: str | Path | None = None,
+                          append: bool = True) -> Atoms:
+        """Resume a simulation from its latest checkpoint.
+
+        With ``append=True``, existing outputs are trimmed to the checkpoint
+        boundary before continuing. With ``append=False``, this resumed segment
+        writes to uniquely named output files while preserving the original run.
+        Args:
+            filepath: Optional path to a YAML configuration file. If not provided, the last used configuration file is reused.
+            append: If ``True``, continue writing to the original output files. If ``False``, write to new files with unique suffixes.
+        Returns:
+            The final ASE Atoms object after the resumed simulation.
+        """
+        configuration_file = Path(filepath) if filepath is not None else self.configuration_file
+        if configuration_file is None:
+            raise ValueError("Provide the configuration filepath before restarting.")
+
+        self.set_yaml(configuration_file, allow_existing_files=True)
+        if self.restart_interval == 0:
+            raise ValueError("restart_interval is 0; restart checkpoints are disabled.")
+        checkpoint = read_restart_checkpoint(self.restart_files["restart_logfile"])
+
+        if append:
+            for attribute, filename in checkpoint.get("output_paths", {}).items():
+                setattr(self, attribute, filename)
+            trim_logs_to_checkpoint(
+                checkpoint["log_offsets"],
+                checkpoint["output_paths"].get("trajectoryfile", self.trajectoryfile),
+                checkpoint["trajectory_frames"],
+            )
+            self._trajectory_frame_count = checkpoint["trajectory_frames"]
+        else:
+            unique_suffix = f".restart-{time_ns()}"
+            output_attributes = (
+                "outputfile", "logfile", "trajectoryfile", "final_structurefile",
+                "best_candidatefile", "best_candidate_rotation_logfile",
+                "best_candidate_permutation_logfile", "best_candidate_dihedral_logfile",
+                "best_candidate_logfile", "orientation_logfile", "permutation_logfile",
+                "dihedral_logfile", "optimization_logfile",
+            )
+            for attribute in output_attributes:
+                filename = getattr(self, attribute)
+                if filename is not None:
+                    path = Path(filename)
+                    setattr(
+                        self,
+                        attribute,
+                        str(path.with_name(f"{path.stem}{unique_suffix}{path.suffix}")),
+                    )
+            self._trajectory_frame_count = 0
+
+        self._elapsed_time_offset = checkpoint["time"]
+        self._restart_energy = checkpoint["energy"]
+        self._current_dftbp_energy = (
+            checkpoint["energy"] if "dftbp" in self.job_type else None
+        )
+        restart_atoms = pq_reader(self.restart_files["restart_structurefile"])
+        self.atoms = addResidueNumberToAtomsWithMoldescribtor(
+            self.moldescriptor, restart_atoms
+        )
+        if self.calculator is not None:
+            self.atoms.calc = self.calculator
+
+        for operation, attribute in (
+            ("orientation", "rotational_log"),
+            ("permutation", "permutation_log"),
+            ("dihedral", "dihedral_log"),
+        ):
+            restart_log = self.restart_files[f"restart_{operation}_logfile"]
+            if restart_log is not None and Path(restart_log).exists():
+                values = np.loadtxt(restart_log, dtype=int, ndmin=2)[-1, 1:]
+                setattr(self, attribute, values)
+
+        checkpoint["new_logs"] = not append
+        if self.job_type == "annealing":
+            return self.thermocycle(_restart_state=checkpoint)
+        if self.job_type == "sampling_constant_T":
+            return self.sampling_constant_T(_restart_state=checkpoint)
+        if self.job_type == "annealing_dftbp":
+            return self.thermocycle_dftbp(_restart_state=checkpoint)
+        if self.job_type == "sampling_constant_T_dftbp":
+            return self.sampling_constant_T_dftbp(_restart_state=checkpoint)
+        raise ValueError(f"Unknown job type: {self.job_type}")
+
+
+    def _elapsed_time(self) -> float:
+        return self._elapsed_time_offset + time() - start_time
+
+
+    def _write_trajectory_frame(self, trajectory, atoms: Atoms) -> None:
+        trajectory.write(atoms)
+        self._trajectory_frame_count += 1
+
+
+    def _write_restart_if_due(self,
+                              cycle_number: int,
+                              step: int,
+                              energy: float,
+                              temperature: float,
+                              accepted: int,
+                              operation_attempts: dict,
+                              operation_accepts: dict,
+                              force: bool = False,
+                              cycle_complete: bool = False) -> None:
+        if self.restart_interval == 0 or (not force and step % self.restart_interval != 0):
+            return
+
+        output_paths = {
+            attribute: getattr(self, attribute)
+            for attribute in (
+                "outputfile", "logfile", "trajectoryfile", "final_structurefile",
+                "best_candidatefile", "best_candidate_rotation_logfile",
+                "best_candidate_permutation_logfile", "best_candidate_dihedral_logfile",
+                "best_candidate_logfile", "orientation_logfile", "permutation_logfile",
+                "dihedral_logfile", "optimization_logfile",
+            )
+        }
+        log_offsets = {
+            str(path): Path(path).stat().st_size if Path(path).exists() else 0
+            for path in output_paths.values()
+            if path is not None and path != self.trajectoryfile
+        }
+        trajectory_frames = self._trajectory_frame_count
+        if self.job_type == "annealing" and self.output_frequency == 0:
+            trajectory_frames = None
+        write_restart_checkpoint(
+            self.atoms,
+            self.restart_files,
+            cycle_number,
+            step,
+            self._elapsed_time(),
+            energy,
+            temperature,
+            accepted / step if step else 0.0,
+            accepted,
+            operation_attempts,
+            operation_accepts,
+            self.rotational_log,
+            self.permutation_log,
+            self.dihedral_log,
+            log_offsets,
+            trajectory_frames,
+            output_paths,
+            cycle_complete,
+        )
+
+
 
     def thermocycle(self,
                    logfile: str | None = None,
                    trajectory_name: str | None = None,
-                   final_structure_name: str | None = None) -> Atoms:
+                   final_structure_name: str | None = None,
+                   _restart_state: dict | None = None) -> Atoms:
         """Run the first high-temperature cycle followed by thermocycles.
 
         The first cycle starts at ``Tfirst`` and uses ``cooling_first``.
@@ -2651,8 +3083,9 @@ C             0       0.0
 
         if self.atoms is None:
             raise ValueError("The structure must be loaded before thermocycle")
-        if not 0 < self.cooling_first <= 1 or not 0 < self.cooling_rate <= 1:
-            raise ValueError("cooling rates must be greater than 0 and less or equal to 1")
+        if self.TRamp == "proportional":
+            if not 0 < self.cooling_first <= 1 or not 0 < self.cooling_rate <= 1:
+                raise ValueError("cooling rates must be greater than 0 and less or equal to 1")
 
         logfile = logfile or self.logfile or "output.dat"
         trajectory_name = trajectory_name or self.trajectoryfile or "traj_annealing.traj"
@@ -2660,7 +3093,10 @@ C             0       0.0
             final_structure_name or self.final_structurefile or "final_structure.xyz"
         )
 
-        trajectory = Trajectory(trajectory_name, "a", self.atoms)
+        trajectory = (
+            Trajectory(trajectory_name, "a", self.atoms)
+            if self.output_frequency != 0 else None
+        )
 
 
 
@@ -2668,41 +3104,57 @@ C             0       0.0
         def run_cycle(initial_temperature: float,
                       cooling_rate: float,
                       cycle_number: int,
-                      log_file) -> Atoms:
+                      log_file,
+                      resume_state: dict | None = None) -> Atoms:
             cycle_best = self.atoms.copy()
             cycle_best_energy = self.atoms.get_potential_energy()
-            temperature = initial_temperature
-            accepted = 0
-            steps = 1
-            operation_attempts = {"rotation": 0, "permutation": 0, "dihedral": 0}
-            operation_accepts = {"rotation": 0, "permutation": 0, "dihedral": 0}
-
-            log_file.write(
-                f"Cycle #{cycle_number}\tSteps\tTime(s)\tEnergy(eV)\t\tTemperature(K)\tAcceptance Ratio"
-                "\tRotation Attempts\tPermutation Attempts"
-                "\tDihedral Attempts\tRotation Acceptance Ratio"
-                "\tPermutation Acceptance Ratio\tDihedral Acceptance Ratio\n"
+            temperature = (
+                resume_state["temperature"] if resume_state is not None
+                else initial_temperature
             )
-            log_file.write(
-                f"\t\t{time() - start_time:.3f}\t{cycle_best_energy:.5f}\tInitial structure!"
-                "\t0\t0\t0.0000\t0.0000\n"
+            accepted = resume_state["accepted"] if resume_state is not None else 0
+            step = resume_state["step"] + 1 if resume_state is not None else 1
+            operation_attempts = (
+                resume_state["operation_attempts"] if resume_state is not None
+                else {"rotation": 0, "permutation": 0, "dihedral": 0}
             )
-            log_file.flush()
+            operation_accepts = (
+                resume_state["operation_accepts"] if resume_state is not None
+                else {"rotation": 0, "permutation": 0, "dihedral": 0}
+            )
+            best_rotational_log = self.rotational_log.copy()
+            best_permutation_log = self.permutation_log.copy()
+            best_dihedral_log = self.dihedral_log.copy()
 
-            trajectory.write(self.atoms)
-            LogToXYZ(self.atoms, self.outputfile)
+            if log_file is not None and (
+                resume_state is None or resume_state["new_logs"]
+            ):
+                log_file.write(
+                    f"Cycle #{cycle_number}\tSteps\tTime(s)\tEnergy(eV)\t\tTemperature(K)\tAcceptance Ratio"
+                    "\tRotation Attempts\tPermutation Attempts"
+                    "\tDihedral Attempts\tRotation Acceptance Ratio"
+                    "\tPermutation Acceptance Ratio\tDihedral Acceptance Ratio\n"
+                )
+                log_file.write(
+                    f"\t\t{self._elapsed_time():.3f}\t{cycle_best_energy:.5f}\tInitial structure!"
+                    f"\t0\t0\t0.0000\t0.0000\n"
+                )
+                log_file.flush()
+
+            if resume_state is None:
+                self._write_restart_if_due(
+                    cycle_number, 0, cycle_best_energy, temperature, 0,
+                    operation_attempts, operation_accepts, force=True,
+                )
 
             while temperature > self.Tfinal:
                 accepted_move, operation, move_data, nOptimizationSteps = self.__metropolis_step__(temperature)
                 operation_attempts[operation] += 1
                 current_energy = self.atoms.get_potential_energy()
+                log_step = should_log_step(self.output_frequency, step, accepted_move)
                 if accepted_move:
                     operation_accepts[operation] += 1
                     accepted += int(accepted_move)
-
-                    trajectory.write(self.atoms)
-                    LogToXYZ(self.atoms, self.outputfile)
-                    LogOptimizationSteps(self.optimization_logfile, steps, nOptimizationSteps, operation[0])
 
                     match operation:
                         case "rotation":
@@ -2714,55 +3166,67 @@ C             0       0.0
                         case "dihedral":
                             update_dihedral(self.dihedral_log,move_data["linker_index"])
 
-                    if self.output_frequency < 0:
-                        append_array_log(self.orientation_logfile, self.rotational_log, steps)
-                        append_array_log(self.permutation_logfile, self.permutation_log, steps)
-                        append_array_log(self.dihedral_logfile, self.dihedral_log, steps)
-
-                        write_acceptance_ratio(log_file,
-                                               steps,
-                                                time() - start_time,
-                                                current_energy,
-                                                temperature,
-                                                accepted / steps,
-                                                operation_attempts["rotation"],
-                                                operation_attempts["permutation"],
-                                                operation_attempts["dihedral"],
-                                                operation_accepts["rotation"] / operation_attempts["rotation"] if operation_attempts["rotation"] else 0.0,
-                                                operation_accepts["permutation"] / operation_attempts["permutation"] if operation_attempts["permutation"] else 0.0,
-                                                operation_accepts["dihedral"] / operation_attempts["dihedral"] if operation_attempts["dihedral"] else 0.0)
-                
-    
-
-                if ((self.output_frequency > 0) and (steps % self.output_frequency == 0)):
-                    append_array_log(self.orientation_logfile, self.rotational_log, steps)
-                    append_array_log(self.permutation_logfile, self.permutation_log, steps)
-                    append_array_log(self.dihedral_logfile, self.dihedral_log, steps)
+                if log_step:
+                    if trajectory is not None:
+                        self._write_trajectory_frame(trajectory, self.atoms)
+                    LogToXYZ(self.atoms, self.outputfile)
+                    LogOptimizationSteps(self.optimization_logfile, step, nOptimizationSteps, operation[0])
+                    write_array_logs(self.orientation_logfile, self.rotational_log, step)
+                    write_array_logs(self.permutation_logfile, self.permutation_log, step)
+                    write_array_logs(self.dihedral_logfile, self.dihedral_log, step)
 
                     write_acceptance_ratio(log_file,
-                                        steps,
-                                        time() - start_time,
+                                        step,
+                                        self._elapsed_time(),
                                         current_energy,
                                         temperature,
-                                        accepted / steps,
+                                        accepted / step,
                                         operation_attempts["rotation"],
                                         operation_attempts["permutation"],
                                         operation_attempts["dihedral"],
                                         operation_accepts["rotation"] / operation_attempts["rotation"] if operation_attempts["rotation"] else 0.0,
                                         operation_accepts["permutation"] / operation_attempts["permutation"] if operation_attempts["permutation"] else 0.0,
                                         operation_accepts["dihedral"] / operation_attempts["dihedral"] if operation_attempts["dihedral"] else 0.0)
-
+                
                 if current_energy < cycle_best_energy:
                     cycle_best = self.atoms.copy()
                     cycle_best_energy = current_energy
-                    LogToXYZ(cycle_best, "BestCandidate.xyz", "w")
+                    best_rotational_log = self.rotational_log.copy()
+                    best_permutation_log = self.permutation_log.copy()
+                    best_dihedral_log = self.dihedral_log.copy()
+                    if self.output_frequency != 0:
+                        LogToXYZ(cycle_best, self.best_candidatefile, "w")
+                        write_array_logs(self.best_candidate_rotation_logfile, self.rotational_log, step, "w")
+                        write_array_logs(self.best_candidate_permutation_logfile, self.permutation_log, step, "w")
+                        write_array_logs(self.best_candidate_dihedral_logfile, self.dihedral_log, step, "w")
+
+                self._write_restart_if_due(
+                    cycle_number, step, current_energy, temperature, accepted,
+                    operation_attempts, operation_accepts,
+                )
                     
 
+                if self.TRamp == "proportional":
+                    temperature *= cooling_rate
+                else:
+                    temperature -= cooling_rate
+                step += 1
 
-                temperature *= cooling_rate
-                steps += 1
+            if step > 1:
+                cycle_best.calc = self.atoms.calc
+                self.atoms = cycle_best.copy()
+                self.atoms.calc = cycle_best.calc
+                self.rotational_log[:] = best_rotational_log
+                self.permutation_log[:] = best_permutation_log
+                self.dihedral_log[:] = best_dihedral_log
+                self._write_restart_if_due(
+                    cycle_number, step - 1, cycle_best_energy,
+                    temperature, accepted, operation_attempts, operation_accepts,
+                    force=True,
+                    cycle_complete=True,
+                )
 
-            print(f"Cycle #{cycle_number} completed after {time() - start_time:.2f} seconds and {steps} steps.\n",
+            print(f"Cycle #{cycle_number} completed after {self._elapsed_time():.2f} seconds and {step} steps.\n",
                   f"Best energy: {cycle_best_energy:.2f} eV.\n")
 
             cycle_best.calc = self.atoms.calc
@@ -2772,19 +3236,51 @@ C             0       0.0
               "Starting thermocycle with {} cycles\n".format(self.thermocycles),
               "This may take a while, get a coffee and relax!\n")
 
-        with open(logfile, "a") as log_file:
-            self.atoms = run_cycle(self.Tfirst, self.cooling_first, 0, log_file)
+        if self.output_frequency != 0:
+            with open(logfile, "a") as log_file:
+                if _restart_state is None:
+                    self.atoms = run_cycle(self.Tfirst, self.cooling_first, 0, log_file)
+                    first_cycle = 1
+                elif _restart_state.get("cycle_complete", False):
+                    first_cycle = _restart_state["cycle"] + 1
+                else:
+                    cycle_number = _restart_state["cycle"]
+                    cooling_rate = self.cooling_first if cycle_number == 0 else self.cooling_rate
+                    self.atoms = run_cycle(
+                        _restart_state["temperature"], cooling_rate, cycle_number,
+                        log_file, _restart_state,
+                    )
+                    first_cycle = cycle_number + 1
 
-            for cycle_number in range(1, self.thermocycles + 1):
-                self.atoms = run_cycle(self.Tinitial,
-                                       self.cooling_rate,
-                                       cycle_number,
-                                       log_file)
+                for cycle_number in range(first_cycle, self.thermocycles + 1):
+                    self.atoms = run_cycle(
+                        self.Tinitial, self.cooling_rate, cycle_number, log_file
+                    )
+        else:
+            if _restart_state is None:
+                self.atoms = run_cycle(self.Tfirst, self.cooling_first, 0, None)
+                first_cycle = 1
+            elif _restart_state.get("cycle_complete", False):
+                first_cycle = _restart_state["cycle"] + 1
+            else:
+                cycle_number = _restart_state["cycle"]
+                cooling_rate = self.cooling_first if cycle_number == 0 else self.cooling_rate
+                self.atoms = run_cycle(
+                    _restart_state["temperature"], cooling_rate, cycle_number,
+                    None, _restart_state,
+                )
+                first_cycle = cycle_number + 1
+
+            for cycle_number in range(first_cycle, self.thermocycles + 1):
+                self.atoms = run_cycle(
+                    self.Tinitial, self.cooling_rate, cycle_number, None
+                )
 
         self.atoms.calc = self.calculator
         #self.atoms.get_potential_energy()
         write(final_structure_name, self.atoms, format="extxyz", append=True)
-        trajectory.close()
+        if trajectory is not None:
+            trajectory.close()
 
         return self.atoms
 
@@ -2794,7 +3290,8 @@ C             0       0.0
     def thermocycle_dftbp(self,
                    logfile: str | None = None,
                    trajectory_name: str | None = None,
-                   final_structure_name: str | None = None) -> Atoms:
+                   final_structure_name: str | None = None,
+                   _restart_state: dict | None = None) -> Atoms:
         """Run the first high-temperature cycle followed by thermocycles.
 
         The first cycle starts at ``Tfirst`` and uses ``cooling_first``.
@@ -2831,33 +3328,61 @@ C             0       0.0
         def run_cycle(initial_temperature: float,
                       cooling_rate: float,
                       cycle_number: int,
-                      log_file) -> Atoms:
+                      log_file,
+                      resume_state: dict | None = None) -> Atoms:
             cycle_best = self.atoms.copy()
-            cycle_best_energy = Energy_from_dftbp_log()
-            temperature = initial_temperature
-            accepted = 0
-            steps = 1
-            operation_attempts = {"rotation": 0, "permutation": 0, "dihedral": 0}
-            operation_accepts = {"rotation": 0, "permutation": 0, "dihedral": 0}
-
-            log_file.write(
-                f"Cycle #{cycle_number}\tSteps\tTime(s)\tEnergy(eV)\t\tTemperature(K)\tAcceptance Ratio"
-                "\tRotation Attempts\tPermutation Attempts"
-                "\tDihedral Attempts\tRotation Acceptance Ratio"
-                "\tPermutation Acceptance Ratio\tDihedral Acceptance Ratio\n"
+            self._current_dftbp_energy = (
+                resume_state["energy"] if resume_state is not None
+                else self._current_dftbp_energy
+                if self._current_dftbp_energy is not None
+                else Energy_from_dftbp_log()
             )
-            log_file.write(
-                f"\t\t{time() - start_time:.3f}\t{cycle_best_energy:.2f}\tInitial structure!"
-                "\t0\t0\t0.0000\t0.0000\n"
+            cycle_best_energy = self._current_dftbp_energy
+            temperature = (
+                resume_state["temperature"] if resume_state is not None
+                else initial_temperature
             )
-            log_file.flush()
+            accepted = resume_state["accepted"] if resume_state is not None else 0
+            step = resume_state["step"] + 1 if resume_state is not None else 1
+            operation_attempts = (
+                resume_state["operation_attempts"] if resume_state is not None
+                else {"rotation": 0, "permutation": 0, "dihedral": 0}
+            )
+            operation_accepts = (
+                resume_state["operation_accepts"] if resume_state is not None
+                else {"rotation": 0, "permutation": 0, "dihedral": 0}
+            )
+            best_rotational_log = self.rotational_log.copy()
+            best_permutation_log = self.permutation_log.copy()
+            best_dihedral_log = self.dihedral_log.copy()
 
-            trajectory.write(self.atoms)
-            LogToXYZ(self.atoms, self.outputfile)
+            if resume_state is None or resume_state["new_logs"]:
+                log_file.write(
+                    f"Cycle #{cycle_number}\tSteps\tTime(s)\tEnergy(eV)\t\tTemperature(K)\tAcceptance Ratio"
+                    "\tRotation Attempts\tPermutation Attempts"
+                    "\tDihedral Attempts\tRotation Acceptance Ratio"
+                    "\tPermutation Acceptance Ratio\tDihedral Acceptance Ratio\n"
+                )
+                log_file.write(
+                    f"\t\t{self._elapsed_time():.3f}\t{cycle_best_energy:.2f}\tInitial structure!"
+                    "\t0\t0\t0.0000\t0.0000\n"
+                )
+                log_file.flush()
+
+            if resume_state is None or resume_state["new_logs"]:
+                self._write_trajectory_frame(trajectory, self.atoms)
+                LogToXYZ(self.atoms, self.outputfile)
+
+            if resume_state is None:
+                self._write_restart_if_due(
+                    cycle_number, 0, cycle_best_energy, temperature, 0,
+                    operation_attempts, operation_accepts, force=True,
+                )
 
 
             # Preoptimize the initial structure with DFTB+ to guess the charges
-            optimize_dftbp(self.dftbp_temporary_optimization_log_file)
+            if resume_state is None:
+                optimize_dftbp(self.dftbp_temporary_optimization_log_file)
 
             # from now on read the charges from the previous optimization step
             GenHSDfromTemplate("dftb_in.template", "dftb_in.hsd", keyGUESS = "yes")
@@ -2866,7 +3391,7 @@ C             0       0.0
             while temperature > self.Tfinal:
                 accepted_move, operation, move_data, nOptimizationSteps = self.__metropolis_step_dftbp__(temperature)
                 operation_attempts[operation] += 1
-                current_energy = Energy_from_dftbp_log()
+                current_energy = self._current_dftbp_energy
                 if accepted_move:
                     operation_accepts[operation] += 1
                     accepted += int(accepted_move)
@@ -2875,11 +3400,9 @@ C             0       0.0
                     self.atoms = addResidueNumberToAtomsWithMoldescribtor(self.moldescriptor,
                                                                           self.atoms)
 
-                    operation_accepts[operation] += 1
-
-                    trajectory.write(self.atoms)
+                    self._write_trajectory_frame(trajectory, self.atoms)
                     LogToXYZ(self.atoms, self.outputfile)
-                    LogOptimizationSteps(self.optimization_logfile, steps, nOptimizationSteps, operation[0])
+                    LogOptimizationSteps(self.optimization_logfile, step, nOptimizationSteps, operation[0])
 
                     match operation:
                         case "rotation":
@@ -2892,16 +3415,16 @@ C             0       0.0
                             update_dihedral(self.dihedral_log,move_data["linker_index"])
 
                     if self.output_frequency < 0:
-                        append_array_log(self.orientation_logfile, self.rotational_log, steps)
-                        append_array_log(self.permutation_logfile, self.permutation_log, steps)
-                        append_array_log(self.dihedral_logfile, self.dihedral_log, steps)
+                        write_array_logs(self.orientation_logfile, self.rotational_log, step)
+                        write_array_logs(self.permutation_logfile, self.permutation_log, step)
+                        write_array_logs(self.dihedral_logfile, self.dihedral_log, step)
 
                         write_acceptance_ratio(log_file,
-                                               steps,
-                                                time() - start_time,
+                                               step,
+                                                self._elapsed_time(),
                                                 current_energy,
                                                 temperature,
-                                                accepted / steps,
+                                                accepted / step,
                                                 operation_attempts["rotation"],
                                                 operation_attempts["permutation"],
                                                 operation_attempts["dihedral"],
@@ -2910,17 +3433,17 @@ C             0       0.0
                                                 operation_accepts["dihedral"] / operation_attempts["dihedral"] if operation_attempts["dihedral"] else 0.0)
                 
                 
-                if ((self.output_frequency > 0) and (steps % self.output_frequency == 0)):
-                    append_array_log(self.orientation_logfile, self.rotational_log, steps)
-                    append_array_log(self.permutation_logfile, self.permutation_log, steps)
-                    append_array_log(self.dihedral_logfile, self.dihedral_log, steps)
+                if ((self.output_frequency > 0) and (step % self.output_frequency == 0)):
+                    write_array_logs(self.orientation_logfile, self.rotational_log, step)
+                    write_array_logs(self.permutation_logfile, self.permutation_log, step)
+                    write_array_logs(self.dihedral_logfile, self.dihedral_log, step)
 
                     write_acceptance_ratio(log_file,
-                                        steps,
-                                        time() - start_time,
+                                        step,
+                                        self._elapsed_time(),
                                         current_energy,
                                         temperature,
-                                        accepted / steps,
+                                        accepted / step,
                                         operation_attempts["rotation"],
                                         operation_attempts["permutation"],
                                         operation_attempts["dihedral"],
@@ -2931,13 +3454,39 @@ C             0       0.0
                 if current_energy < cycle_best_energy:
                     cycle_best = self.atoms.copy()
                     cycle_best_energy = current_energy
-                    LogToXYZ(cycle_best, "BestCandidate.xyz", "w")
+                    best_rotational_log = self.rotational_log.copy()
+                    best_permutation_log = self.permutation_log.copy()
+                    best_dihedral_log = self.dihedral_log.copy()
+                    LogToXYZ(cycle_best, self.best_candidatefile, "w")
+                    write_array_logs(self.best_candidate_rotation_logfile, self.rotational_log, step, "w")
+                    write_array_logs(self.best_candidate_permutation_logfile, self.permutation_log, step, "w")
+                    write_array_logs(self.best_candidate_dihedral_logfile, self.dihedral_log, step, "w")
 
+                self._write_restart_if_due(
+                    cycle_number, step, current_energy, temperature, accepted,
+                    operation_attempts, operation_accepts,
+                )
 
-                temperature *= cooling_rate
-                steps += 1
+                if self.TRamp == "proportional":
+                    temperature *= cooling_rate
+                else:
+                    temperature -= cooling_rate
+                step += 1
 
-            print(f"Cycle #{cycle_number} completed after {time() - start_time:.2f} seconds and {steps} steps.\n",
+            if step > 1:
+                self.atoms = cycle_best.copy()
+                self.rotational_log[:] = best_rotational_log
+                self.permutation_log[:] = best_permutation_log
+                self.dihedral_log[:] = best_dihedral_log
+                self._current_dftbp_energy = cycle_best_energy
+                self._write_restart_if_due(
+                    cycle_number, step - 1, cycle_best_energy,
+                    temperature, accepted, operation_attempts, operation_accepts,
+                    force=True,
+                    cycle_complete=True,
+                )
+
+            print(f"Cycle #{cycle_number} completed after {self._elapsed_time():.2f} seconds and {step} steps.\n",
                   f"Best energy: {cycle_best_energy:.2f} eV.\n")
 
             cycle_best.calc = self.atoms.calc
@@ -2948,13 +3497,24 @@ C             0       0.0
               "This may take a while, get a coffee and relax!\n")
 
         with open(logfile, "a") as log_file:
-            self.atoms = run_cycle(self.Tfirst, self.cooling_first, 0, log_file)
+            if _restart_state is None:
+                self.atoms = run_cycle(self.Tfirst, self.cooling_first, 0, log_file)
+                first_cycle = 1
+            elif _restart_state.get("cycle_complete", False):
+                first_cycle = _restart_state["cycle"] + 1
+            else:
+                cycle_number = _restart_state["cycle"]
+                cooling_rate = self.cooling_first if cycle_number == 0 else self.cooling_rate
+                self.atoms = run_cycle(
+                    _restart_state["temperature"], cooling_rate, cycle_number,
+                    log_file, _restart_state,
+                )
+                first_cycle = cycle_number + 1
 
-            for cycle_number in range(1, self.thermocycles + 1):
-                self.atoms = run_cycle(self.Tinitial,
-                                       self.cooling_rate,
-                                       cycle_number,
-                                       log_file)
+            for cycle_number in range(first_cycle, self.thermocycles + 1):
+                self.atoms = run_cycle(
+                    self.Tinitial, self.cooling_rate, cycle_number, log_file
+                )
 
         write(final_structure_name, self.atoms, format="extxyz", append=True)
         trajectory.close()
@@ -2967,7 +3527,8 @@ C             0       0.0
 
 
 
-    def sampling_constant_T(self) -> Atoms:
+    def sampling_constant_T(self,
+                            _restart_state: dict | None = None) -> Atoms:
         """Run a constant-temperature sampling simulation.
 
         Returns:
@@ -2979,10 +3540,20 @@ C             0       0.0
 
         cycle_best = self.atoms.copy()
         cycle_number = 0
-        cycle_best_energy = self.atoms.get_potential_energy()
-        accepted = 0
-        operation_attempts = {"rotation": 0, "permutation": 0, "dihedral": 0}
-        operation_accepts = {"rotation": 0, "permutation": 0, "dihedral": 0}
+        cycle_best_energy = (
+            _restart_state["energy"] if _restart_state is not None
+            else self.atoms.get_potential_energy()
+        )
+        accepted = _restart_state["accepted"] if _restart_state is not None else 0
+        operation_attempts = (
+            _restart_state["operation_attempts"] if _restart_state is not None
+            else {"rotation": 0, "permutation": 0, "dihedral": 0}
+        )
+        operation_accepts = (
+            _restart_state["operation_accepts"] if _restart_state is not None
+            else {"rotation": 0, "permutation": 0, "dihedral": 0}
+        )
+        first_step = _restart_state["step"] if _restart_state is not None else 0
         trajectory = Trajectory(self.trajectoryfile, "a", self.atoms)
         
 
@@ -2992,27 +3563,33 @@ C             0       0.0
 
         
 
-        with open(self.logfile, "a") as log_file:
-            log_file.write(
-                f"Cycle #{cycle_number}\tSteps\tTime(s)\tEnergy(eV)\t\tTemperature(K)\tAcceptance Ratio"
-                "\tRotation Attempts\tPermutation Attempts"
-                "\tDihedral Attempts\tRotation Acceptance Ratio"
-                "\tPermutation Acceptance Ratio\tDihedral Acceptance Ratio\n"
+        if _restart_state is None or _restart_state["new_logs"]:
+            with open(self.logfile, "a") as log_file:
+                log_file.write(
+                    f"Cycle #{cycle_number}\tSteps\tTime(s)\tEnergy(eV)\t\tTemperature(K)\tAcceptance Ratio"
+                    "\tRotation Attempts\tPermutation Attempts"
+                    "\tDihedral Attempts\tRotation Acceptance Ratio"
+                    "\tPermutation Acceptance Ratio\tDihedral Acceptance Ratio\n"
+                )
+                log_file.write(
+                    f"\t\t{self._elapsed_time():.3f}\t{cycle_best_energy:.2f}\tInitial structure!"
+                    "\t0\t0\t0.0000\t0.0000\n"
+                )
+                log_file.flush()
+            self._write_trajectory_frame(trajectory, self.atoms)
+            LogToXYZ(self.atoms, self.outputfile)
+
+        if _restart_state is None:
+            self._write_restart_if_due(
+                cycle_number, 0, cycle_best_energy, self.Tsampling, 0,
+                operation_attempts, operation_accepts, force=True,
             )
-            log_file.write(
-                f"\t\t{time() - start_time:.3f}\t{cycle_best_energy:.2f}\tInitial structure!"
-                "\t0\t0\t0.0000\t0.0000\n"
-            )
-            log_file.flush()
-
-        trajectory.write(self.atoms)
-        LogToXYZ(self.atoms, self.outputfile)
 
 
 
         with open(self.logfile, "a") as log_file:
 
-            for step in range(self.sampling_steps):
+            for step in range(first_step, self.sampling_steps):
                 accepted_move, operation, move_data, nOptimizationSteps = self.__metropolis_step__(self.Tsampling)
                 operation_attempts[operation] += 1
                 current_energy = self.atoms.get_potential_energy()
@@ -3035,13 +3612,13 @@ C             0       0.0
                     LogToXYZ(self.atoms, self.outputfile)
 
                     if self.output_frequency < 0:
-                        append_array_log(self.orientation_logfile, self.rotational_log, step)
-                        append_array_log(self.permutation_logfile, self.permutation_log, step)
-                        append_array_log(self.dihedral_logfile, self.dihedral_log, step)
+                        write_array_logs(self.orientation_logfile, self.rotational_log, step)
+                        write_array_logs(self.permutation_logfile, self.permutation_log, step)
+                        write_array_logs(self.dihedral_logfile, self.dihedral_log, step)
 
                         write_acceptance_ratio(log_file,
                                                 step,
-                                                time() - start_time,
+                                                self._elapsed_time(),
                                                 current_energy,
                                                 self.Tsampling,
                                                 accepted / (step+1),
@@ -3055,13 +3632,13 @@ C             0       0.0
                 
 
                 if ((self.output_frequency > 0) and (step % self.output_frequency == 0)):
-                    append_array_log(self.orientation_logfile, self.rotational_log, step)
-                    append_array_log(self.permutation_logfile, self.permutation_log, step)
-                    append_array_log(self.dihedral_logfile, self.dihedral_log, step)
+                    write_array_logs(self.orientation_logfile, self.rotational_log, step)
+                    write_array_logs(self.permutation_logfile, self.permutation_log, step)
+                    write_array_logs(self.dihedral_logfile, self.dihedral_log, step)
 
                     write_acceptance_ratio(log_file,
                                         step,
-                                        time() - start_time,
+                                        self._elapsed_time(),
                                             current_energy,
                                             self.Tsampling,
                                             accepted / (step+1),
@@ -3075,8 +3652,21 @@ C             0       0.0
                 if current_energy < cycle_best_energy:
                     cycle_best = self.atoms.copy()
                     cycle_best_energy = current_energy
-                    LogToXYZ(cycle_best, "BestCandidate.xyz", "w")
+                    LogToXYZ(cycle_best, self.best_candidatefile, "w")
+                    write_array_logs(self.best_candidate_rotation_logfile, self.rotational_log, step, "w")
+                    write_array_logs(self.best_candidate_permutation_logfile, self.permutation_log, step, "w")
+                    write_array_logs(self.best_candidate_dihedral_logfile, self.dihedral_log, step, "w")
 
+                self._write_restart_if_due(
+                    cycle_number, step + 1, current_energy, self.Tsampling, accepted,
+                    operation_attempts, operation_accepts,
+                )
+
+            self._write_restart_if_due(
+                cycle_number, self.sampling_steps,
+                self.atoms.get_potential_energy(), self.Tsampling, accepted,
+                operation_attempts, operation_accepts, force=True,
+            )
 
 
 
@@ -3093,7 +3683,8 @@ C             0       0.0
 
 
 
-    def sampling_constant_T_dftbp(self) -> Atoms:
+    def sampling_constant_T_dftbp(self,
+                                 _restart_state: dict | None = None) -> Atoms:
         """Run a constant-temperature sampling simulation using DFTB+.
 
         Returns:
@@ -3108,10 +3699,21 @@ C             0       0.0
 
         cycle_best = self.atoms.copy()
         cycle_number = 0
-        cycle_best_energy = Energy_from_dftbp_log()
-        accepted = 0
-        operation_attempts = {"rotation": 0, "permutation": 0, "dihedral": 0}
-        operation_accepts = {"rotation": 0, "permutation": 0, "dihedral": 0}
+        cycle_best_energy = (
+            _restart_state["energy"] if _restart_state is not None
+            else Energy_from_dftbp_log()
+        )
+        self._current_dftbp_energy = cycle_best_energy
+        accepted = _restart_state["accepted"] if _restart_state is not None else 0
+        operation_attempts = (
+            _restart_state["operation_attempts"] if _restart_state is not None
+            else {"rotation": 0, "permutation": 0, "dihedral": 0}
+        )
+        operation_accepts = (
+            _restart_state["operation_accepts"] if _restart_state is not None
+            else {"rotation": 0, "permutation": 0, "dihedral": 0}
+        )
+        first_step = _restart_state["step"] if _restart_state is not None else 0
         trajectory = Trajectory(self.trajectoryfile, "a", self.atoms)
         
 
@@ -3121,26 +3723,33 @@ C             0       0.0
 
         
 
-        with open(self.logfile, "a") as log_file:
-            log_file.write(
-                f"Cycle #{cycle_number}\tSteps\tTime(s)\tEnergy(eV)\t\tTemperature(K)\tAcceptance Ratio"
-                "\tRotation Attempts\tPermutation Attempts"
-                "\tDihedral Attempts\tRotation Acceptance Ratio"
-                "\tPermutation Acceptance Ratio\tDihedral Acceptance Ratio\n"
-            )
-            log_file.write(
-                f"\t\t{time() - start_time:.3f}\t{cycle_best_energy:.2f}\tInitial structure!"
-                "\t0\t0\t0.0000\t0.0000\n"
-            )
-            log_file.flush()
+        if _restart_state is None or _restart_state["new_logs"]:
+            with open(self.logfile, "a") as log_file:
+                log_file.write(
+                    f"Cycle #{cycle_number}\tSteps\tTime(s)\tEnergy(eV)\t\tTemperature(K)\tAcceptance Ratio"
+                    "\tRotation Attempts\tPermutation Attempts"
+                    "\tDihedral Attempts\tRotation Acceptance Ratio"
+                    "\tPermutation Acceptance Ratio\tDihedral Acceptance Ratio\n"
+                )
+                log_file.write(
+                    f"\t\t{self._elapsed_time():.3f}\t{cycle_best_energy:.2f}\tInitial structure!"
+                    "\t0\t0\t0.0000\t0.0000\n"
+                )
+                log_file.flush()
+            self._write_trajectory_frame(trajectory, self.atoms)
+            LogToXYZ(self.atoms, self.outputfile)
 
-        trajectory.write(self.atoms)
-        LogToXYZ(self.atoms, self.outputfile)
+        if _restart_state is None:
+            self._write_restart_if_due(
+                cycle_number, 0, cycle_best_energy, self.Tsampling, 0,
+                operation_attempts, operation_accepts, force=True,
+            )
 
 
         # Preoptimize the initial structure with DFTB+ to guess the charges
         GenHSDfromTemplate("dftb_in.template", "dftb_in.hsd", keyGUESS = "no")
-        optimize_dftbp(self.dftbp_temporary_optimization_log_file)
+        if _restart_state is None:
+            optimize_dftbp(self.dftbp_temporary_optimization_log_file)
 
         # from now on read the charges from the previous optimization step
         GenHSDfromTemplate("dftb_in.template", "dftb_in.hsd", keyGUESS = "yes")
@@ -3149,10 +3758,10 @@ C             0       0.0
 
         with open(self.logfile, "a") as log_file:
 
-            for step in range(self.sampling_steps):
+            for step in range(first_step, self.sampling_steps):
                 accepted_move, operation, move_data, nOptimizationSteps = self.__metropolis_step_dftbp__(self.Tsampling)
                 operation_attempts[operation] += 1
-                current_energy = Energy_from_dftbp_log()
+                current_energy = self._current_dftbp_energy
                 if accepted_move:
                     operation_accepts[operation] += 1
                     accepted += int(accepted_move)
@@ -3176,13 +3785,13 @@ C             0       0.0
                     LogToXYZ(self.atoms, self.outputfile)
 
                     if self.output_frequency < 0:
-                        append_array_log(self.orientation_logfile, self.rotational_log, step)
-                        append_array_log(self.permutation_logfile, self.permutation_log, step)
-                        append_array_log(self.dihedral_logfile, self.dihedral_log, step)
+                        write_array_logs(self.orientation_logfile, self.rotational_log, step)
+                        write_array_logs(self.permutation_logfile, self.permutation_log, step)
+                        write_array_logs(self.dihedral_logfile, self.dihedral_log, step)
 
                         write_acceptance_ratio(log_file,
                                         step,
-                                        time() - start_time,
+                                        self._elapsed_time(),
                                             current_energy,
                                             self.Tsampling,
                                             accepted / (step+1),
@@ -3194,13 +3803,13 @@ C             0       0.0
                                             operation_accepts["dihedral"] / operation_attempts["dihedral"] if operation_attempts["dihedral"] else 0.0)
 
                 if ((self.output_frequency > 0) and (step % self.output_frequency == 0)):
-                    append_array_log(self.orientation_logfile, self.rotational_log, step)
-                    append_array_log(self.permutation_logfile, self.permutation_log, step)
-                    append_array_log(self.dihedral_logfile, self.dihedral_log, step)
+                    write_array_logs(self.orientation_logfile, self.rotational_log, step)
+                    write_array_logs(self.permutation_logfile, self.permutation_log, step)
+                    write_array_logs(self.dihedral_logfile, self.dihedral_log, step)
 
                     write_acceptance_ratio(log_file,
                                         step,
-                                        time() - start_time,
+                                        self._elapsed_time(),
                                             current_energy,
                                             self.Tsampling,
                                             accepted / (step+1),
@@ -3214,12 +3823,35 @@ C             0       0.0
                 if current_energy < cycle_best_energy:
                     cycle_best = self.atoms.copy()
                     cycle_best_energy = current_energy
-                    LogToXYZ(cycle_best, "BestCandidate.xyz", "w")
+                    LogToXYZ(cycle_best, self.best_candidatefile, "w")
+                    write_array_logs(self.best_candidate_rotation_logfile, self.rotational_log, step, "w")
+                    write_array_logs(self.best_candidate_permutation_logfile, self.permutation_log, step, "w")
+                    write_array_logs(self.best_candidate_dihedral_logfile, self.dihedral_log, step, "w")
+
+                self._write_restart_if_due(
+                    cycle_number, step + 1, current_energy, self.Tsampling, accepted,
+                    operation_attempts, operation_accepts,
+                )
+
+            self._write_restart_if_due(
+                cycle_number, self.sampling_steps, self._current_dftbp_energy,
+                self.Tsampling, accepted, operation_attempts, operation_accepts,
+                force=True,
+            )
 
         write(self.final_structurefile, cycle_best, format="extxyz", append=True)
         trajectory.close()
 
         return self.atoms
+
+
+
+
+
+
+
+
+
 
 
 
