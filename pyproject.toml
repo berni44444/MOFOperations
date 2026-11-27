@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mof-operations"
-version = "0.1.1"
+version = "0.1.2"
 description = "Python utilities for MOF structure operations"
 requires-python = ">=3.10"
 

@@ -2,6 +2,7 @@
 
 from pathlib import Path
 from time import time, time_ns
+import os
 from matplotlib.table import Cell
 import numpy as np
 
@@ -34,6 +35,16 @@ else:
 
 
 start_time = time()
+
+
+def initialize_random_seed(seed: int,
+                           seed_log_file: str | Path,
+                           write_seed: bool = True) -> None:
+    """Seed NumPy's global RNG and optionally write the resolved seed once."""
+    np.random.seed(seed)
+    if write_seed:
+        with Path(seed_log_file).open("x", encoding="utf-8") as seed_file:
+            seed_file.write(f"{seed}\n")
 
 
 def readYaml(filepath: str, allow_existing_files: bool = False):
@@ -71,6 +82,7 @@ def readYaml(filepath: str, allow_existing_files: bool = False):
     else:
         outputfile = paramsYaml["outputfile"]
 
+    
     paramsYaml["outputfile"] = outputfile
 
         # output frequency
@@ -79,7 +91,7 @@ def readYaml(filepath: str, allow_existing_files: bool = False):
         raise TypeError(f"Invalid 'output_frequency': {paramsYaml['output_frequency']}. "
                         "The value must be an integer.")
 
-    restart_interval = paramsYaml.get("restart_interval", 100)
+    restart_interval = paramsYaml.get("restart_interval", 300)
     if (not isinstance(restart_interval, int)
             or isinstance(restart_interval, bool)
             or restart_interval < 0):
@@ -88,9 +100,20 @@ def readYaml(filepath: str, allow_existing_files: bool = False):
             f"{restart_interval}. The value must be a non-negative integer."
         )
 
+    seed = paramsYaml.get("seed")
+    if seed is None:
+        seed = (os.getpid() ^ time_ns()) & 0xFFFFFFFF
+    elif (not isinstance(seed, int)
+          or isinstance(seed, bool)
+          or not 0 <= seed <= 0xFFFFFFFF):
+        raise TypeError("Invalid 'seed': the value must be an integer from 0 to 4294967295, or null.")
+
 
 
     prefix = paramsYaml.get("prefix", "")
+    seed_filename = (
+        f"{prefix.rstrip('_')}_random_seed.dat" if prefix else "random_seed.dat"
+    )
 
     def configured_path(name: str, default: str | None = None) -> str | None:
         filename = paramsYaml.get(name, default)
@@ -114,6 +137,7 @@ def readYaml(filepath: str, allow_existing_files: bool = False):
         "permutation_logfile": configured_path("permutation_logfile"),
         "dihedral_logfile": configured_path("dihedral_logfile"),
         "optimization_logfile": configured_path("optimization_logfile"),
+        "random_seed_file": str(folder / seed_filename),
         "dftbp_temporary_optimization_log_file": configured_path(
             "dftbp_temporary_optimization_log_file", "dftb.out"
         ),
@@ -147,6 +171,12 @@ def readYaml(filepath: str, allow_existing_files: bool = False):
         if len(logging_paths) != len(set(logging_paths)):
             raise ValueError("Logging files must have different filenames.")
 
+    if not allow_existing_files and Path(logging_files["random_seed_file"]).exists():
+        raise FileExistsError(
+            f"Random seed file already exists: '{logging_files['random_seed_file']}'. "
+            "Please choose a different filename."
+        )
+
     if restart_interval > 0:
         restart_paths = [Path(filename) for filename in restart_files.values()]
         if len(restart_paths) != len(set(restart_paths)):
@@ -170,6 +200,7 @@ def readYaml(filepath: str, allow_existing_files: bool = False):
     paramsYaml.update(logging_files)
     paramsYaml.update(restart_files)
     paramsYaml["restart_interval"] = restart_interval
+    paramsYaml["seed"] = seed
     
 
 
@@ -1186,7 +1217,7 @@ def write_acceptance_ratio(f,
 
     f.write(
         f"\t\t{steps}\t{time:.3f}"
-        f"\t{energy:.5f}\t{temperature:.3f}\t\t{ratio:.4f}"
+        f"\t{energy:16.8f}\t{temperature:.3f}\t\t{ratio:.4f}"
         f"\t{rotation_attempts}\t{permutation_attempts}"
         f"\t{dihedral_attempts}"
         f"\t{rotation_ratio:.4f}\t{permutation_ratio:.4f}"
@@ -1253,6 +1284,7 @@ def write_restart_checkpoint(atoms: Atoms,
                              rotational_log: np.ndarray,
                              permutation_log: np.ndarray,
                              dihedral_log: np.ndarray,
+                             seed: int,
                              log_offsets: dict[str, int],
                              trajectory_frames: int,
                              output_paths: dict[str, str | None],
@@ -1274,7 +1306,16 @@ def write_restart_checkpoint(atoms: Atoms,
             )
 
     with open(restart_files["restart_logfile"], "w", encoding="utf-8") as log_file:
+        random_state = np.random.get_state()
         checkpoint = {
+            "seed": seed,
+            "numpy_random_state": [
+                random_state[0],
+                random_state[1].tolist(),
+                int(random_state[2]),
+                int(random_state[3]),
+                float(random_state[4]),
+            ],
             "cycle": cycle_number,
             "step": step,
             "accepted": accepted,
@@ -2124,6 +2165,8 @@ class MOF:
         self.restart_files = None
         self._trajectory_frame_count = 0
         self.configuration_file = None
+        self.seed = None
+        self.random_seed_file = None
         self._elapsed_time_offset = 0.0
         self._restart_energy = None
         self._current_dftbp_energy = None
@@ -2169,6 +2212,9 @@ folder: {folder}
 
 # Optional prefix added to every generated logging filename.
 prefix: ""
+
+# Optional reproducibility seed. Use null to generate one from PID and time.
+seed: null
 
 # Copy an input structure to this filename before running the calculation.
 filename: {input_filename}
@@ -2410,6 +2456,13 @@ C             0       0.0
 
         paramsYaml = readYaml(filepath, allow_existing_files=allow_existing_files)
         self.configuration_file = Path(filepath)
+        self.seed = paramsYaml["seed"]
+        self.random_seed_file = paramsYaml["random_seed_file"]
+        initialize_random_seed(
+            self.seed,
+            self.random_seed_file,
+            write_seed=not allow_existing_files,
+        )
 
         self.job_type = paramsYaml["job_type"]
 
@@ -2992,6 +3045,33 @@ C             0       0.0
                 setattr(self, attribute, values)
 
         checkpoint["new_logs"] = not append
+        self.seed = checkpoint["seed"]
+        numpy_random_state = checkpoint["numpy_random_state"]
+        np.random.set_state((
+            numpy_random_state[0],
+            np.asarray(numpy_random_state[1], dtype=np.uint32),
+            numpy_random_state[2],
+            numpy_random_state[3],
+            numpy_random_state[4],
+        ))
+        if "annealing" in self.job_type:
+            if checkpoint.get("cycle_complete", False):
+                resume_cycle = checkpoint["cycle"] + 1
+                print(
+                    f"\nRestart file read. Resuming simulation from cycle "
+                    f"{resume_cycle} (cycle {checkpoint['cycle']} is complete).\n"
+                )
+            else:
+                print(
+                    f"\nRestart file read. Resuming simulation from step "
+                    f"{checkpoint['step'] + 1} of cycle {checkpoint['cycle']}.\n"
+                )
+        else:
+            print(
+                f"\nRestart file read. Resuming simulation from step "
+                f"{checkpoint['step'] + 1} of {self.sampling_steps}.\n"
+            )
+
         if self.job_type == "annealing":
             return self.thermocycle(_restart_state=checkpoint)
         if self.job_type == "sampling_constant_T":
@@ -3058,6 +3138,7 @@ C             0       0.0
             self.rotational_log,
             self.permutation_log,
             self.dihedral_log,
+            self.seed,
             log_offsets,
             trajectory_frames,
             output_paths,
@@ -3136,7 +3217,7 @@ C             0       0.0
                     "\tPermutation Acceptance Ratio\tDihedral Acceptance Ratio\n"
                 )
                 log_file.write(
-                    f"\t\t{self._elapsed_time():.3f}\t{cycle_best_energy:.5f}\tInitial structure!"
+                    f"\t\t{self._elapsed_time():.3f}\t{cycle_best_energy:16.8f}\tInitial structure!"
                     f"\t0\t0\t0.0000\t0.0000\n"
                 )
                 log_file.flush()
@@ -3232,7 +3313,7 @@ C             0       0.0
             cycle_best.calc = self.atoms.calc
             return cycle_best
 
-        print("\n Setup complete. Initial energy is {:.2f} eV.\n".format(self.atoms.get_potential_energy()),
+        print("\n Setup complete. Initial energy is {:16.8f} eV.\n".format(self.atoms.get_potential_energy()),
               "Starting thermocycle with {} cycles\n".format(self.thermocycles),
               "This may take a while, get a coffee and relax!\n")
 
@@ -3487,12 +3568,12 @@ C             0       0.0
                 )
 
             print(f"Cycle #{cycle_number} completed after {self._elapsed_time():.2f} seconds and {step} steps.\n",
-                  f"Best energy: {cycle_best_energy:.2f} eV.\n")
+                  f"Best energy: {cycle_best_energy:16.8f} eV.\n")
 
             cycle_best.calc = self.atoms.calc
             return cycle_best
 
-        print("\n Setup complete. Initial energy is {:.2f} eV.\n".format(Energy_from_dftbp_log()),
+        print("\n Setup complete. Initial energy is {:16.8f} eV.\n".format(Energy_from_dftbp_log()),
               "Starting thermocycle with {} cycles\n".format(self.thermocycles),
               "This may take a while, get a coffee and relax!\n")
 
@@ -3557,7 +3638,7 @@ C             0       0.0
         trajectory = Trajectory(self.trajectoryfile, "a", self.atoms)
         
 
-        print("\n Setup complete. Initial energy is {:.2f} eV.\n".format(self.atoms.get_potential_energy()),
+        print("\n Setup complete. Initial energy is {:16.8f} eV.\n".format(self.atoms.get_potential_energy()),
                 "Starting sampling with {} steps at {} K\n".format(self.sampling_steps, self.Tsampling),
                 "This may take a while, get a coffee and relax!\n")
 
@@ -3572,7 +3653,7 @@ C             0       0.0
                     "\tPermutation Acceptance Ratio\tDihedral Acceptance Ratio\n"
                 )
                 log_file.write(
-                    f"\t\t{self._elapsed_time():.3f}\t{cycle_best_energy:.2f}\tInitial structure!"
+                    f"\t\t{self._elapsed_time():.3f}\t{cycle_best_energy:16.8f}\tInitial structure!"
                     "\t0\t0\t0.0000\t0.0000\n"
                 )
                 log_file.flush()
@@ -3717,7 +3798,7 @@ C             0       0.0
         trajectory = Trajectory(self.trajectoryfile, "a", self.atoms)
         
 
-        print("\n Setup complete. Initial energy is {:.2f} eV.\n".format(Energy_from_dftbp_log()),
+        print("\n Setup complete. Initial energy is {:16.8f} eV.\n".format(Energy_from_dftbp_log()),
                 "Starting sampling with {} steps at {} K\n".format(self.sampling_steps, self.Tsampling),
                 "This may take a while, get a coffee and relax!\n")
 
@@ -3732,7 +3813,7 @@ C             0       0.0
                     "\tPermutation Acceptance Ratio\tDihedral Acceptance Ratio\n"
                 )
                 log_file.write(
-                    f"\t\t{self._elapsed_time():.3f}\t{cycle_best_energy:.2f}\tInitial structure!"
+                    f"\t\t{self._elapsed_time():.3f}\t{cycle_best_energy:16.8f}\tInitial structure!"
                     "\t0\t0\t0.0000\t0.0000\n"
                 )
                 log_file.flush()
